@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -27,9 +28,12 @@ type Server struct {
 	cancel   context.CancelFunc
 	client   *AwfulClient
 
-	lock       *sync.RWMutex
-	threads    map[int64]*threadRepresentation
-	shortNames map[string]*threadRepresentation
+	lock                *sync.RWMutex
+	threads             map[int64]*threadRepresentation
+	shortNames          map[string]*threadRepresentation
+	privateMessages     map[string][]string
+	seenPrivateMessages map[int64]struct{}
+	connections         map[*serverConnection]struct{}
 }
 
 // Listen starts an IRC bridge with the given somethingawful.com
@@ -68,9 +72,28 @@ func Listen(ctx context.Context, username, password, name, addr string) (*Server
 		threads:    make(map[int64]*threadRepresentation),
 		shortNames: make(map[string]*threadRepresentation),
 
-		username: username,
+		privateMessages:     make(map[string][]string),
+		seenPrivateMessages: make(map[int64]struct{}),
+
+		username:    username,
+		connections: make(map[*serverConnection]struct{}),
 	}
+
+	func() {
+		tr := &threadRepresentation{
+			meta: ThreadMetadata{
+				ID:    -1,
+				Title: "Leper's Colony",
+			},
+			shortName:   "lc",
+			subscribers: make(map[*serverConnection]struct{}),
+		}
+		s.shortNames["lc"] = tr
+		go s.repeatUpdatingLC(tr)
+	}()
+
 	go s.repeatUpdatingThreads()
+	go s.repeatUpdatingPrivateMessages()
 	go s.loop()
 
 	return s, nil
@@ -84,6 +107,22 @@ func Listen(ctx context.Context, username, password, name, addr string) (*Server
 //
 // TODO: stop listening when all clients disconnect.
 func (s *Server) startThreadListener(thread *threadRepresentation) {
+	s.startThreadListenerWithPostGetter(thread, func(ctx context.Context, thread *threadRepresentation) (Posts, error) {
+		return s.client.ParseUnreadPosts(ctx, thread.meta)
+	})
+}
+
+func (s *Server) repeatUpdatingLC(thread *threadRepresentation) {
+	s.startThreadListenerWithPostGetter(thread, func(ctx context.Context, thread *threadRepresentation) (Posts, error) {
+		posts, err := s.client.ParseLepersColony(ctx)
+		if err != nil {
+			return Posts{}, err
+		}
+		return *posts, nil
+	})
+}
+
+func (s *Server) startThreadListenerWithPostGetter(thread *threadRepresentation, pg func(context.Context, *threadRepresentation) (Posts, error)) {
 	thread.lock.Lock()
 	defer thread.lock.Unlock()
 	if thread.listening {
@@ -96,7 +135,7 @@ func (s *Server) startThreadListener(thread *threadRepresentation) {
 		defer cancel()
 
 		for {
-			p, err := s.client.ParseUnreadPosts(ctx, thread.meta)
+			p, err := pg(ctx, thread)
 			if err != nil {
 				log.Print(err)
 				// TODO: Remove all subscribers in error cases. Right
@@ -113,7 +152,7 @@ func (s *Server) startThreadListener(thread *threadRepresentation) {
 					continue
 				}
 				thread.seen[post.ID] = struct{}{}
-				auth := post.IRCAuthor()
+				auth := AuthorToIRC(post.Author)
 				if _, ok := thread.authors[auth]; !ok {
 					joined[auth] = struct{}{}
 				}
@@ -131,7 +170,8 @@ func (s *Server) startThreadListener(thread *threadRepresentation) {
 
 			// Mirror all posts now that no authors are missing.
 			for i := origLen; i < len(thread.posts); i++ {
-				ircPost := thread.posts[i].IRCLines("#" + thread.shortName)
+				author := AuthorToIRC(thread.posts[i].Author)
+				ircPost := MessageToIRC(author, "#"+thread.shortName, thread.posts[i].Body)
 				for sub := range thread.subscribers {
 					sub.enqueueLines(ircPost...)
 				}
@@ -167,7 +207,7 @@ func (s *Server) lockedMakeShortName(title string) string {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			cleaned.WriteRune(r)
 			prevSpace = false
-		} else if unicode.IsSpace(r) && !prevSpace {
+		} else if (unicode.IsSpace(r) || r == '_' || r == '-') && !prevSpace {
 			cleaned.WriteByte(' ')
 			prevSpace = true
 		}
@@ -181,7 +221,7 @@ func (s *Server) lockedMakeShortName(title string) string {
 		if len(pieces) == 0 {
 			var digit int
 			for {
-				short := fmt.Sprintf("empty.%d", digit)
+				short := fmt.Sprintf("empty-%d", digit)
 				if s.shortNames[short] == nil {
 					return short
 				}
@@ -193,9 +233,9 @@ func (s *Server) lockedMakeShortName(title string) string {
 		case "a", "an", "the":
 			pieces = pieces[1:]
 		default:
-			// Try period joined.
+			// Try hyphen joined.
 			for i := 1; i <= len(pieces); i++ {
-				short := strings.Join(pieces[0:i], ".")
+				short := strings.Join(pieces[0:i], "-")
 				if s.shortNames[short] == nil {
 					return short
 				}
@@ -205,7 +245,7 @@ func (s *Server) lockedMakeShortName(title string) string {
 			// This is guaranteed to eventually work.
 			var digit int
 			for {
-				short := fmt.Sprintf("%s.%d", pieces[0], digit)
+				short := fmt.Sprintf("%s-%d", pieces[0], digit)
 				if s.shortNames[short] == nil {
 					return short
 				}
@@ -239,9 +279,16 @@ func (s *Server) updateThreads(threads []ThreadMetadata) {
 			}
 			got.lock.Unlock()
 		} else {
+			var shortName string
+			if th.Hint != "" {
+				shortName = s.lockedMakeShortName(th.Hint)
+			} else {
+				shortName = s.lockedMakeShortName(th.Title)
+			}
+
 			repr := &threadRepresentation{
 				meta:        th,
-				shortName:   s.lockedMakeShortName(th.Title),
+				shortName:   shortName,
 				subscribers: make(map[*serverConnection]struct{}),
 			}
 			s.threads[th.ID] = repr
@@ -251,9 +298,54 @@ func (s *Server) updateThreads(threads []ThreadMetadata) {
 	}
 }
 
+func (s *Server) repeatUpdatingPrivateMessages() {
+	for {
+		pms, err := s.client.ParsePrivateMessages(s.ctx)
+		if err != nil {
+			log.Print("ParsePrivateMessages: ", err)
+		}
+
+		// PMs are listed in descending order. Form the list in
+		// chronological order.
+		for _, pm := range slices.Backward(pms) {
+			// Private messages are one per thread, so if we've seen
+			// it, no need to re-query the thread.
+			_, ok := s.seenPrivateMessages[pm.ID]
+			if ok {
+				continue
+			}
+
+			msg, err := s.client.parsePrivateMessageID(s.ctx, pm.ID)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+
+			s.seenPrivateMessages[pm.ID] = struct{}{}
+			s.lock.Lock()
+			author := AuthorToIRC(pm.Author)
+			s.privateMessages[author] = append(s.privateMessages[author], msg)
+			for sub := range s.connections {
+				lines := MessageToIRC(author, sub.nick, msg)
+				sub.enqueueLines(lines...)
+			}
+			s.lock.Unlock()
+		}
+
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+
+	}
+}
+
 // repeatUpdatingThreads periodically parses bookmarks to create the
 // server channel list.
 func (s *Server) repeatUpdatingThreads() {
+	s.updateThreads(WellKnownThreads)
+
 	// Try every minute until the initial parse succeeds.
 	//
 	// TODO: Not really tested since I don't have many bookmarks. Try
@@ -322,10 +414,15 @@ func (s *Server) accept() error {
 
 		host: "cloaked",
 
-		threads: make(map[string]*threadRepresentation),
+		threads:             make(map[string]*threadRepresentation),
+		seenPrivateMessages: make(map[int64]struct{}),
 	}
 
 	go sc.run()
+
+	s.lock.Lock()
+	s.connections[sc] = struct{}{}
+	s.lock.Unlock()
 
 	return nil
 }

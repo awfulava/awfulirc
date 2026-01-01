@@ -44,8 +44,8 @@ const (
 	Command_Ping
 	Command_Pong
 	Command_Error
-
 	Command_Cap
+	Command_Ison
 )
 
 var (
@@ -253,6 +253,8 @@ ForEachByte:
 		cm.Command = Command_Error
 	case "cap":
 		cm.Command = Command_Cap
+	case "ison":
+		cm.Command = Command_Ison
 	}
 
 	return cm, nil

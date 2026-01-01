@@ -6,11 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,21 +22,19 @@ import (
 
 // AwfulClient accesses and parses somethingawful.com.
 type AwfulClient struct {
-	client *http.Client
+	client *LimitedHTTPClient
 }
 
 // NewAwfulClient returns an empty client that has not been logged in yet. Some
 // operations should work without logging in, but that flow has not been tested
 // much, so you probably want to Login immediately after construction.
 func NewAwfulClient() (*AwfulClient, error) {
-	jar, err := cookiejar.New(nil)
+	hc, err := NewLimitedHTTPClient()
 	if err != nil {
-		return nil, fmt.Errorf("unable to create cookie jar: %w", err)
+		return nil, err
 	}
 	return &AwfulClient{
-		client: &http.Client{
-			Jar: jar,
-		},
+		client: hc,
 	}, nil
 }
 
@@ -85,6 +84,11 @@ type ThreadMetadata struct {
 
 	// Updated is the last thread update time.
 	Updated time.Time
+
+	// Hint is a manually specified short name hint. See
+	// well_known_threads.go for hard-coded threads with hints based
+	// on canonical names.
+	Hint string
 }
 
 // LastPostURL returns the URL to the thread's last post page.
@@ -124,20 +128,80 @@ type Post struct {
 	Body string
 }
 
-// IRCAuthor converts the author to a standardized IRC-compatible
-// representation.
-func (p Post) IRCAuthor() string {
-	author := strings.ReplaceAll(p.Author, " ", "")
-	author = strings.ReplaceAll(author, "_", "__")
-	author = strings.ReplaceAll(author, ":", "_")
-	return author
+var (
+	authorToIRCReplacer = strings.NewReplacer(
+		"_", "_-",
+		" ", "__",
+		":", "_.",
+		"#", "_^",
+	)
+
+	ircToAuthorReplacer = strings.NewReplacer(
+		"_-", "_",
+		"__", " ",
+		"_.", ":",
+		"_^", "#",
+	)
+)
+
+// AuthorToIRC returns the IRC-normalized author name.
+func AuthorToIRC(author string) string {
+	return authorToIRCReplacer.Replace(author)
 }
 
-// IRCLines formats the post for display in the target channel by truncating
-// into lines of appropriate length along sensible boundaries.
-func (p Post) IRCLines(ch string) []string {
-	body := p.Body
-	author := p.IRCAuthor()
+// IRCToAuthor inverts the IRC-normalized author name into the forum name.
+func IRCToAuthor(irc string) string {
+	return ircToAuthorReplacer.Replace(irc)
+}
+
+// NormalizePost converts a node that wraps a post into an IRC-friendly string.
+// This function is not responsible for converting the string into
+// IRC-delimited lines.
+func NormalizePost(post *html.Node) string {
+	var builder strings.Builder
+	for n := range post.ChildNodes() {
+		if n.Type == html.TextNode {
+			builder.WriteString(n.Data)
+		} else if n.Type == html.ElementNode && n.DataAtom == atom.Br {
+			builder.WriteString("\n")
+		} else if n.Type == html.ElementNode && n.DataAtom == atom.A {
+			var (
+				href string
+				text string
+			)
+			for _, attr := range n.Attr {
+				if attr.Key == "href" {
+					href = attr.Val
+				}
+			}
+			for inner := range n.ChildNodes() {
+				if inner.Type == html.TextNode {
+					text = inner.Data
+				}
+			}
+
+			switch {
+			case href == "":
+				builder.WriteString(text)
+			case text == "":
+				builder.WriteString(href)
+			case href == text:
+				builder.WriteString(href)
+			default:
+				builder.WriteString("[")
+				builder.WriteString(text)
+				builder.WriteString("](")
+				builder.WriteString(href)
+				builder.WriteString(")")
+			}
+		}
+	}
+	return strings.ReplaceAll(strings.TrimSpace(builder.String()), "\n\n", "\n")
+}
+
+// MessageToIRC converts a post into a sequence of PRIVMSG messages that
+// respect IRC limits.
+func MessageToIRC(author, ch, body string) []string {
 	prefix := fmt.Sprintf(":%s PRIVMSG %s :", author, ch)
 	messageLen := 512 - len(prefix) - 2
 
@@ -195,6 +259,312 @@ type Posts struct {
 	Posts       []Post
 	CurrentPage int64
 	TotalPages  int64
+}
+
+// ParseLepersColony returns the lepers colony formatted as a sequence of
+// posts.
+func (a *AwfulClient) ParseLepersColony(ctx context.Context) (*Posts, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://forums.somethingawful.com/banlist.php", nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		io.Copy(os.Stdout, res.Body)
+		return nil, fmt.Errorf("get failed with status: %v", res.StatusCode)
+	}
+
+	doc, err := html.Parse(res.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		currentPageStr string
+		totalPageStr   string
+		posts          []Post
+	)
+
+	parseTr := func(tr *html.Node, postid string) {
+		var (
+			action    string
+			timestr   string
+			target    string
+			reason    string
+			requested string
+			approved  string
+			i         int
+		)
+
+		for n := range tr.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Td {
+				switch i {
+				case 0:
+					// Sometimes this isn't linked to a post.
+					if postid == "0" {
+						for b := range n.ChildNodes() {
+							for t := range b.ChildNodes() {
+								if t.Type == html.TextNode {
+									action = t.Data
+								}
+							}
+						}
+					} else {
+						for b := range n.ChildNodes() {
+							for a := range b.ChildNodes() {
+								for t := range a.ChildNodes() {
+									if t.Type == html.TextNode {
+										action = t.Data
+									}
+								}
+							}
+						}
+					}
+				case 1:
+					for t := range n.ChildNodes() {
+						if t.Type == html.TextNode {
+							timestr = t.Data
+						}
+					}
+				case 2:
+					for b := range n.ChildNodes() {
+						for a := range b.ChildNodes() {
+							for t := range a.ChildNodes() {
+								if t.Type == html.TextNode {
+									target = t.Data
+								}
+							}
+						}
+					}
+				case 3:
+					reason = NormalizePost(n)
+				case 4:
+					for a := range n.ChildNodes() {
+						for t := range a.ChildNodes() {
+							if t.Type == html.TextNode {
+								requested = t.Data
+							}
+						}
+					}
+				case 5:
+					for a := range n.ChildNodes() {
+						for t := range a.ChildNodes() {
+							if t.Type == html.TextNode {
+								approved = t.Data
+							}
+						}
+					}
+				}
+
+				i++
+			}
+		}
+
+		if action != "" && timestr != "" && target != "" && reason != "" && requested != "" && approved != "" {
+			postidnum, err := strconv.ParseInt(postid, 10, 64)
+			if err != nil {
+				log.Print("postid: ", err)
+				return
+			}
+
+			posttime, err := time.Parse("01/02/06 03:04pm", timestr)
+			if err != nil {
+				log.Print("posttime: ", err)
+				return
+			}
+
+			// Should be unique enough for this.
+			id := posttime.Unix()*10000 + postidnum%10000
+
+			var b strings.Builder
+			b.WriteString(action)
+			b.WriteString(" for [")
+			b.WriteString(target)
+			b.WriteString("] (approved by ")
+			b.WriteString(approved)
+			b.WriteString(")\n")
+			b.WriteString(reason)
+
+			posts = append(posts, Post{
+				ID:     id,
+				Author: requested,
+				Body:   b.String(),
+			})
+
+		}
+	}
+
+	parseTbody := func(tbody *html.Node) {
+		for n := range tbody.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Tr {
+				for _, attr := range n.Attr {
+					if attr.Key == "data-postid" && attr.Val != "" {
+						parseTr(n, attr.Val)
+					}
+				}
+			}
+		}
+	}
+
+	parseTable := func(table *html.Node) {
+		for n := range table.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Tbody {
+				parseTbody(n)
+			}
+		}
+	}
+
+	parseInner := func(content *html.Node) {
+		for n := range content.ChildNodes() {
+			if currentPageStr == "" || totalPageStr == "" {
+				if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+					for _, attr := range n.Attr {
+						if attr.Key == "class" && attr.Val == "mqnav" {
+							for nav := range n.ChildNodes() {
+								if nav.Type == html.ElementNode && nav.DataAtom == atom.Div {
+									for _, attr := range nav.Attr {
+										if attr.Key == "data-current-page" {
+											currentPageStr = attr.Val
+										} else if attr.Key == "data-total-pages" {
+											totalPageStr = attr.Val
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			} else if n.Type == html.ElementNode && n.DataAtom == atom.Table {
+				// The information is in the table after the mqnav which contains the pages info.
+				parseTable(n)
+			}
+		}
+	}
+
+	parseStandard := func(content *html.Node) {
+		for n := range content.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "class" && attr.Val == "inner" {
+						parseInner(n)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	parseContent := func(content *html.Node) {
+		for n := range content.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "class" && attr.Val == "standard" {
+						parseStandard(n)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	parseContainer := func(container *html.Node) {
+		for n := range container.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "content" {
+						parseContent(n)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	parseBody := func(body *html.Node) {
+		for n := range body.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "container" {
+						parseContainer(n)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	for n := range doc.ChildNodes() {
+		if n.Type == html.ElementNode && n.DataAtom == atom.Html {
+			for body := range n.ChildNodes() {
+				if body.Type == html.ElementNode && body.DataAtom == atom.Body {
+					parseBody(body)
+				}
+			}
+		}
+	}
+
+	currentPage, err := strconv.ParseInt(currentPageStr, 10, 64)
+	if err != nil {
+		log.Print("current page: ", err)
+		return nil, err
+	}
+	totalPage, err := strconv.ParseInt(totalPageStr, 10, 64)
+	if err != nil {
+		log.Print("total page: ", err)
+		return nil, err
+	}
+	slices.Reverse(posts)
+	return &Posts{
+		Posts:       posts,
+		CurrentPage: currentPage,
+		TotalPages:  totalPage,
+	}, nil
+}
+
+// SendPrivateMessage composes a private message to the given user. The user
+// must be specified as a forum login, not as a normalized IRC name.
+func (a *AwfulClient) SendPrivateMessage(ctx context.Context, to, title, message string) error {
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	fw, err := w.CreateFormField("action")
+	fw.Write([]byte("dosend"))
+	w.CreateFormField("forward")
+	fw, _ = w.CreateFormField("touser")
+	fw.Write([]byte(to))
+	fw, _ = w.CreateFormField("title")
+	fw.Write([]byte(title))
+	fw, _ = w.CreateFormField("iconid")
+	fw.Write([]byte("0"))
+	fw, _ = w.CreateFormField("message")
+	fw.Write([]byte(message))
+	fw, _ = w.CreateFormField("parseurl")
+	fw.Write([]byte("yes"))
+	fw, _ = w.CreateFormField("savecopy")
+	fw.Write([]byte("yes"))
+	fw, _ = w.CreateFormField("submit")
+	fw.Write([]byte("Send Message"))
+	w.Close()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://forums.somethingawful.com/private.php?action=newmessage", &b)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	res, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		io.Copy(os.Stdout, res.Body)
+		return fmt.Errorf("post failed with status: %v", res.StatusCode)
+	}
+
+	return nil
 }
 
 // ReplyToThread replies to the given thread with the given message.
@@ -434,50 +804,6 @@ func (a *AwfulClient) parsePosts(ctx context.Context, body io.Reader) (Posts, er
 		return ""
 	}
 
-	parsePostBody := func(td *html.Node) string {
-		var builder strings.Builder
-
-		for n := range td.ChildNodes() {
-			if n.Type == html.TextNode {
-				builder.WriteString(n.Data)
-			} else if n.Type == html.ElementNode && n.DataAtom == atom.Br {
-				builder.WriteString("\n")
-			} else if n.Type == html.ElementNode && n.DataAtom == atom.A {
-				var (
-					href string
-					text string
-				)
-				for _, attr := range n.Attr {
-					if attr.Key == "href" {
-						href = attr.Val
-					}
-				}
-				for inner := range n.ChildNodes() {
-					if inner.Type == html.TextNode {
-						text = inner.Data
-					}
-				}
-
-				switch {
-				case href == "":
-					builder.WriteString(text)
-				case text == "":
-					builder.WriteString(href)
-				case href == text:
-					builder.WriteString(href)
-				default:
-					builder.WriteString("[")
-					builder.WriteString(text)
-					builder.WriteString("](")
-					builder.WriteString(href)
-					builder.WriteString(")")
-				}
-			}
-		}
-
-		return builder.String()
-	}
-
 	parsePost := func(tr *html.Node) (string, string) {
 		var (
 			username string
@@ -486,7 +812,7 @@ func (a *AwfulClient) parsePosts(ctx context.Context, body io.Reader) (Posts, er
 		for td := range tr.ChildNodes() {
 			for _, attr := range td.Attr {
 				if attr.Key == "class" && attr.Val == "postbody" {
-					body = parsePostBody(td)
+					body = NormalizePost(td)
 				} else if attr.Key == "class" && strings.HasPrefix(attr.Val, "userinfo ") {
 					username = parseUserInfo(td)
 				}
@@ -530,7 +856,7 @@ func (a *AwfulClient) parsePosts(ctx context.Context, body io.Reader) (Posts, er
 				posts.Posts = append(posts.Posts, Post{
 					ID:     id,
 					Author: username,
-					Body:   strings.ReplaceAll(strings.TrimSpace(postbody), "\n\n", "\n"),
+					Body:   postbody,
 				})
 			}
 		}
@@ -681,6 +1007,294 @@ func (a *AwfulClient) ParseRecentBookmarks(ctx context.Context) ([]ThreadMetadat
 
 	th, err := a.parseThreadsFromResponse(res)
 	return th.Threads, err
+}
+
+// PrivateMessageMetadata represents a listing in the PM inbox.
+type PrivateMessageMetadata struct {
+	ID     int64
+	Author string
+	Time   time.Time
+}
+
+// ParsePrivateMessages returns all inbox messages.
+func (a *AwfulClient) ParsePrivateMessages(ctx context.Context) ([]PrivateMessageMetadata, error) {
+	u := "https://forums.somethingawful.com/private.php"
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	return a.parsePrivateMessageFolder(ctx, res.Body)
+
+	// TODO: How to stitch sent messages in for replay?
+}
+
+func (a *AwfulClient) parsePrivateMessageID(ctx context.Context, id int64) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("https://forums.somethingawful.com/private.php?action=show&privatemessageid=%d", id), nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	doc, err := html.Parse(res.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var message string
+
+	parseTr := func(tr *html.Node) {
+		for n := range tr.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Td {
+				for _, attr := range n.Attr {
+					if attr.Key == "class" && attr.Val == "postbody" {
+						message = NormalizePost(n)
+					}
+				}
+			}
+		}
+	}
+
+	parseTbody := func(tbody *html.Node) {
+		for n := range tbody.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Tr {
+				parseTr(n)
+				return
+			}
+		}
+	}
+
+	parseTable := func(table *html.Node) {
+		for n := range table.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Tbody {
+				parseTbody(n)
+			}
+		}
+	}
+
+	parseThread := func(thread *html.Node) {
+		for n := range thread.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Table {
+				parseTable(n)
+			}
+		}
+	}
+
+	parseContent := func(content *html.Node) {
+		for n := range content.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "thread" {
+						parseThread(n)
+					}
+				}
+			}
+		}
+	}
+
+	parseContainer := func(container *html.Node) {
+		for n := range container.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "content" {
+						parseContent(n)
+					}
+				}
+			}
+		}
+	}
+
+	parseBody := func(body *html.Node) {
+		for n := range body.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "container" {
+						parseContainer(n)
+					}
+				}
+			}
+		}
+	}
+
+	for n := range doc.ChildNodes() {
+		if n.Type == html.ElementNode && n.DataAtom == atom.Html {
+			for body := range n.ChildNodes() {
+				if body.Type == html.ElementNode && body.DataAtom == atom.Body {
+					parseBody(body)
+				}
+			}
+		}
+	}
+
+	if message == "" {
+		return "", errors.New("no direct message parsed")
+	}
+
+	return message, nil
+}
+
+func (a *AwfulClient) parsePrivateMessageFolder(ctx context.Context, r io.Reader) ([]PrivateMessageMetadata, error) {
+	var messages []PrivateMessageMetadata
+
+	doc, err := html.Parse(r)
+	if err != nil {
+		return nil, err
+	}
+
+	parseTr := func(body *html.Node) {
+		var (
+			idstr   string
+			author  string
+			datestr string
+		)
+
+		for n := range body.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Td {
+				for _, attr := range n.Attr {
+					if attr.Key == "class" {
+						switch attr.Val {
+						case "title":
+							for a := range n.ChildNodes() {
+								if a.Type == html.ElementNode && a.DataAtom == atom.A {
+									for _, attr := range a.Attr {
+										if attr.Key == "href" {
+											u, err := url.Parse(attr.Val)
+											if err != nil {
+												log.Print(err)
+												continue
+											}
+											if v, ok := u.Query()["privatemessageid"]; ok {
+												idstr = v[0]
+											}
+										}
+									}
+								}
+							}
+						case "sender":
+							for a := range n.ChildNodes() {
+								if a.Type == html.ElementNode && a.DataAtom == atom.A {
+									for t := range a.ChildNodes() {
+										if t.Type == html.TextNode {
+											author = t.Data
+										}
+									}
+								}
+							}
+
+						case "date":
+							for t := range n.ChildNodes() {
+								if t.Type == html.TextNode {
+									datestr = t.Data
+								}
+							}
+						}
+					}
+
+				}
+			}
+		}
+
+		if idstr != "" && author != "" && datestr != "" {
+			id, err := strconv.ParseInt(idstr, 10, 64)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+
+			dt, err := time.Parse("Jan _2, 2006 at 15:04", datestr)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+
+			messages = append(messages, PrivateMessageMetadata{
+				ID:     id,
+				Author: author,
+				Time:   dt,
+			})
+		}
+	}
+
+	parseTbody := func(body *html.Node) {
+		for n := range body.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Tr {
+				parseTr(n)
+			}
+		}
+	}
+
+	parseTable := func(table *html.Node) {
+		for n := range table.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Tbody {
+				parseTbody(n)
+			}
+		}
+	}
+
+	parseForm := func(form *html.Node) {
+		for n := range form.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Table {
+				parseTable(n)
+			}
+		}
+	}
+
+	parseContent := func(content *html.Node) {
+		for n := range content.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Form {
+				for _, attr := range n.Attr {
+					if attr.Key == "name" && attr.Val == "form" {
+						parseForm(n)
+					}
+				}
+			}
+		}
+	}
+
+	parseContainer := func(container *html.Node) {
+		for n := range container.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "content" {
+						parseContent(n)
+					}
+				}
+			}
+		}
+	}
+
+	parseBody := func(body *html.Node) {
+		for n := range body.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "container" {
+						parseContainer(n)
+					}
+				}
+			}
+		}
+	}
+
+	for n := range doc.ChildNodes() {
+		if n.Type == html.ElementNode && n.DataAtom == atom.Html {
+			for body := range n.ChildNodes() {
+				if body.Type == html.ElementNode && body.DataAtom == atom.Body {
+					parseBody(body)
+				}
+			}
+		}
+	}
+
+	return messages, nil
+
 }
 
 func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThreads, error) {

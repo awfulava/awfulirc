@@ -31,6 +31,8 @@ type serverConnection struct {
 	realname string
 
 	threads map[string]*threadRepresentation
+
+	seenPrivateMessages map[int64]struct{}
 }
 
 // run is the internal entrypoint for a client.
@@ -39,6 +41,29 @@ func (s *serverConnection) run() {
 	go s.receiveFromClientLoop()
 	s.enqueueMotd()
 	go s.sendPingLoop()
+	s.updatePrivateMessages()
+}
+
+// nickArgument returns the IRC argument for this connection. It is * before
+// connecting and the nick after connecting.
+func (s *serverConnection) nickArgument() string {
+	if s.nick == "" {
+		return "*"
+	}
+	return s.nick
+}
+
+// updatePrivateMessages does an initial dump of private messages on
+// connection.
+func (s *serverConnection) updatePrivateMessages() {
+	s.server.lock.Lock()
+	defer s.server.lock.Unlock()
+	for author, messages := range s.server.privateMessages {
+		for _, m := range messages {
+			lines := MessageToIRC(author, s.nickArgument(), m)
+			s.enqueueLines(lines...)
+		}
+	}
 }
 
 // enqueueMotd sends the message of the day.
@@ -163,27 +188,15 @@ func (s *serverConnection) onCap(msg *ClientMessage) {
 }
 
 func (s *serverConnection) enqueueCapLsReply() {
-	nick := "*"
-	if s.nick != "" {
-		nick = s.nick
-	}
-	s.enqueueLines(fmt.Sprintf("CAP %s LS *", nick))
+	s.enqueueLines(fmt.Sprintf("CAP %s LS *", s.nickArgument()))
 }
 
 func (s *serverConnection) enqueueCapEndReply() {
-	nick := "*"
-	if s.nick != "" {
-		nick = s.nick
-	}
-	s.enqueueLines(fmt.Sprintf("001 %s :Connected to %s", nick, s.server.name))
+	s.enqueueLines(fmt.Sprintf("001 %s :Connected to %s", s.nickArgument(), s.server.name))
 }
 
 func (s *serverConnection) enqueueInvalidCap(sc string) {
-	nick := "*"
-	if s.nick != "" {
-		nick = s.nick
-	}
-	s.enqueueLines(fmt.Sprintf("410 %s %s :Invalid CAP command", nick, sc))
+	s.enqueueLines(fmt.Sprintf("410 %s %s :Invalid CAP command", s.nickArgument(), sc))
 }
 
 func (s *serverConnection) enqueueNoSuchChannel(ch string) {
@@ -234,7 +247,8 @@ func (s *serverConnection) onJoin(msg *ClientMessage) {
 
 		// Broadcast all initial messages to the user.
 		for _, p := range thread.posts {
-			s.enqueueLines(p.IRCLines(ch)...)
+			author := AuthorToIRC(p.Author)
+			s.enqueueLines(MessageToIRC(author, ch, p.Body)...)
 		}
 		thread.lock.Unlock()
 	}
@@ -307,8 +321,14 @@ func (s *serverConnection) onPrivmsg(msg *ClientMessage) {
 				continue
 
 			}
+		} else if !strings.HasPrefix(target, "#") && len(target) > 0 {
+			// Assume this is a nick.
+			author := IRCToAuthor(target)
+			if err := s.server.client.SendPrivateMessage(s.ctx, author, "chat", msg.Parameters[1]); err != nil {
+				log.Print(err)
+			}
+
 		} else {
-			// TODO: support for direct messages.
 			s.enqueueLines(fmt.Sprintf("401 %s %s :No such nick/channel", s.nick, target))
 		}
 	}
@@ -316,6 +336,44 @@ func (s *serverConnection) onPrivmsg(msg *ClientMessage) {
 
 func (s *serverConnection) enqueueChannelTopic(ch string, topic string) {
 	s.enqueueLines(fmt.Sprintf("332 %s %s :%s", s.nick, ch, topic))
+}
+
+func (s *serverConnection) onWho(msg *ClientMessage) {
+	if len(msg.Parameters) == 0 {
+		s.enqueueLines(fmt.Sprintf("315 %s :End of /WHO list", s.nickArgument()))
+		return
+	}
+
+	if !strings.HasPrefix(msg.Parameters[0], "#") || msg.Parameters[0] == "#" {
+		s.enqueueLines(fmt.Sprintf("315 %s :End of /WHO list", msg.Parameters[0]))
+		return
+	}
+
+	ch := string(msg.Parameters[0][1:])
+	s.server.lock.Lock()
+	thread := s.server.shortNames[ch]
+	s.server.lock.Unlock()
+
+	if thread == nil {
+		s.enqueueLines(fmt.Sprintf("315 %s :End of /WHO list", ch))
+		return
+	}
+
+	thread.lock.Lock()
+	defer thread.lock.Unlock()
+	for author := range thread.authors {
+		s.enqueueLines(fmt.Sprintf("352 #%s %s somethingawful.com * %s H :0 %s", msg.Parameters[0], author, author, author))
+	}
+	s.enqueueLines(fmt.Sprintf("315 %s :End of /WHO list", ch))
+
+}
+
+func (s *serverConnection) onIson(msg *ClientMessage) {
+	if len(msg.Parameters) == 0 {
+		s.enqueueNeedMoreParams("ISON")
+		return
+	}
+	s.enqueueLines(fmt.Sprintf("303 :%s", strings.Join(msg.Parameters, " ")))
 }
 
 func (s *serverConnection) receiveFromClientLoop() {
@@ -340,6 +398,10 @@ func (s *serverConnection) receiveFromClientLoop() {
 				s.onList(msg)
 			case Command_Privmsg:
 				s.onPrivmsg(msg)
+			case Command_Who:
+				s.onWho(msg)
+			case Command_Ison:
+				s.onIson(msg)
 			default:
 				log.Print("Unknown message: ", msg)
 				s.enqueueLines(fmt.Sprintf("421 %s :Unknown command", msg.RawCommand))
