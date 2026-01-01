@@ -8,6 +8,7 @@ import (
 	"log"
 	"maps"
 	"net"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -329,10 +330,29 @@ func (s *serverConnection) onPrivmsg(msg *ClientMessage) {
 				continue
 			}
 
-			if err := s.server.client.ReplyToThread(s.ctx, got.meta, msg.Parameters[1]); err != nil {
+			// As a special case, support <nick>: syntax to reply to
+			// known users. For example Foo: whatever will quote the
+			// previous post by Foo and then put your message.
+			message := msg.Parameters[1]
+			if replyTo, body, ok := strings.Cut(msg.Parameters[1], ": "); ok {
+				got.lock.Lock()
+				if _, ok := got.authors[replyTo]; ok {
+					// Hunt for the most recent post by that author.
+					// TODO: this should be indexed but who has time for that.
+					for _, post := range slices.Backward(got.posts) {
+						var b strings.Builder
+						b.WriteString(fmt.Sprintf("[quote=%q post=\"%d\"]\n[/quote]\n\n", post.Author, post.ID))
+						b.WriteString(body)
+						message = b.String()
+						break
+					}
+				}
+				got.lock.Unlock()
+			}
+
+			if err := s.server.client.ReplyToThread(s.ctx, got.meta, message); err != nil {
 				s.enqueueLines(fmt.Sprintf("404 %s %s :%s", s.nick, target, err.Error()))
 				continue
-
 			}
 		} else if !strings.HasPrefix(target, "#") && len(target) > 0 {
 			// Assume this is a nick.
