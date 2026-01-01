@@ -297,14 +297,14 @@ func (s *serverConnection) onList(msg *ClientMessage) {
 		it = maps.All(s.server.shortNames)
 	}
 
-	s.enqueueLines("321 Channel :Users  Name")
+	s.enqueueLines(fmt.Sprintf("321 %s Channel :Users  Name", s.nickArgument()))
 	s.server.lock.RLock()
 	for name, rep := range it {
-		m := fmt.Sprintf("322 %s #%s 0 :%s", s.nick, name, rep.meta.Title)
+		m := fmt.Sprintf("322 %s #%s 0 :%s", s.nickArgument(), name, rep.meta.Title)
 		s.enqueueLines(m)
 	}
 	s.server.lock.RUnlock()
-	s.enqueueLines("323 :End of /LIST")
+	s.enqueueLines(fmt.Sprintf("323 %s :End of /LIST", s.nickArgument()))
 }
 
 func (s *serverConnection) onPrivmsg(msg *ClientMessage) {
@@ -375,9 +375,9 @@ func (s *serverConnection) onWho(msg *ClientMessage) {
 	thread.lock.Lock()
 	defer thread.lock.Unlock()
 	for author := range thread.authors {
-		s.enqueueLines(fmt.Sprintf("352 #%s %s somethingawful.com * %s H :0 %s", msg.Parameters[0], author, author, author))
+		s.enqueueLines(fmt.Sprintf("352 %s #%s %s somethingawful.com * %s H :0 %s", s.nickArgument(), msg.Parameters[0], author, author, author))
 	}
-	s.enqueueLines(fmt.Sprintf("315 %s :End of /WHO list", ch))
+	s.enqueueLines(fmt.Sprintf("315 %s %s :End of /WHO list", s.nickArgument(), ch))
 
 }
 
