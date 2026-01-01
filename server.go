@@ -162,7 +162,7 @@ func (s *Server) startThreadListenerWithPostGetter(thread *threadRepresentation,
 
 			// Consider the new author to have joined if we see a new post from them.
 			for auth := range joined {
-				joinMessage := fmt.Sprintf(":%s JOIN #%s", auth, thread.shortName)
+				joinMessage := fmt.Sprintf(":%s!%s@somethingawful.com JOIN #%s", auth, auth, thread.shortName)
 				for sub := range thread.subscribers {
 					sub.enqueueLines(joinMessage)
 				}

@@ -254,7 +254,7 @@ func (s *serverConnection) onJoin(msg *ClientMessage) {
 		thread.subscribers[s] = struct{}{}
 
 		// Broadcast the topic and members to the user.
-		s.enqueueLines(fmt.Sprintf(":%s JOIN %s", s.nick, ch))
+		s.enqueueLines(fmt.Sprintf(":%s!%s@%s JOIN %s", s.nick, s.user, s.host, ch))
 		s.enqueueChannelTopic(ch, thread.meta.Title)
 		s.enqueueChannelMembers(ch, thread.authors)
 
