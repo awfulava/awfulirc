@@ -32,6 +32,8 @@ type serverConnection struct {
 
 	threads map[string]*threadRepresentation
 
+	registered bool
+
 	seenPrivateMessages map[int64]struct{}
 }
 
@@ -39,7 +41,6 @@ type serverConnection struct {
 func (s *serverConnection) run() {
 	go s.sendToClientLoop()
 	go s.receiveFromClientLoop()
-	s.enqueueMotd()
 	go s.sendPingLoop()
 	s.updatePrivateMessages()
 }
@@ -69,9 +70,9 @@ func (s *serverConnection) updatePrivateMessages() {
 // enqueueMotd sends the message of the day.
 func (s *serverConnection) enqueueMotd() {
 	s.enqueueLines(
-		fmt.Sprintf("375 :- %s Message of the day - ", s.server.name),
-		"372 :- awfulirc bridge",
-		"376 :End of /MOTD command",
+		fmt.Sprintf("375 %s :- %s Message of the day - ", s.nickArgument(), s.server.name),
+		fmt.Sprintf("372 %s :- awfulirc bridge", s.nickArgument()),
+		fmt.Sprintf("376 %s :End of /MOTD command", s.nickArgument()),
 	)
 }
 
@@ -143,7 +144,11 @@ func (s *serverConnection) onNick(msg *ClientMessage) {
 	case 0:
 		s.enqueueNoNicknameGiven()
 	default:
+		if s.registered {
+			s.enqueueLines(fmt.Sprintf(":%s NICK %s", s.nick, msg.Parameters[0]))
+		}
 		s.nick = msg.Parameters[0]
+		s.maybeRegister()
 	}
 }
 
@@ -164,6 +169,7 @@ func (s *serverConnection) onUser(msg *ClientMessage) {
 		s.host = msg.Parameters[1]
 		// Ignore server intentionally
 		s.realname = msg.Parameters[3]
+		s.maybeRegister()
 	}
 }
 
@@ -181,17 +187,24 @@ func (s *serverConnection) onCap(msg *ClientMessage) {
 	case "REQ":
 		log.Print("unhandled CAP REQ")
 	case "END":
-		s.enqueueCapEndReply()
+		s.maybeRegister()
 	default:
 		s.enqueueInvalidCap(sc)
 	}
 }
 
 func (s *serverConnection) enqueueCapLsReply() {
-	s.enqueueLines(fmt.Sprintf("CAP %s LS *", s.nickArgument()))
+	s.enqueueLines(fmt.Sprintf("CAP %s LS :awfulirc", s.nickArgument()))
 }
 
-func (s *serverConnection) enqueueCapEndReply() {
+func (s *serverConnection) maybeRegister() {
+	if s.registered {
+		return
+	}
+	if s.nick == "" || s.user == "" {
+		return
+	}
+	s.registered = true
 	s.enqueueLines(fmt.Sprintf("001 %s :Connected to %s", s.nickArgument(), s.server.name))
 }
 
@@ -376,6 +389,22 @@ func (s *serverConnection) onIson(msg *ClientMessage) {
 	s.enqueueLines(fmt.Sprintf("303 :%s", strings.Join(msg.Parameters, " ")))
 }
 
+func (s *serverConnection) onWhois(msg *ClientMessage) {
+	if len(msg.Parameters) == 0 {
+		s.enqueueNeedMoreParams("WHOIS")
+		return
+	}
+	s.enqueueLines(fmt.Sprintf("401 %s :No such nick/channel", msg.Parameters[0]))
+}
+
+func (s *serverConnection) onPing(msg *ClientMessage) {
+	if len(msg.Parameters) == 0 {
+		s.enqueueNeedMoreParams("PING")
+		return
+	}
+	s.enqueueLines(fmt.Sprintf("PONG %s :%s", s.server.name, msg.Parameters[0]))
+}
+
 func (s *serverConnection) receiveFromClientLoop() {
 	it := NewClientMessageIterator(s.conn)
 	for msg, err := range it {
@@ -390,6 +419,8 @@ func (s *serverConnection) receiveFromClientLoop() {
 				s.onUser(msg)
 			case Command_Cap:
 				s.onCap(msg)
+			case Command_Ping:
+				s.onPing(msg)
 			case Command_Pong:
 				// Do nothing; we update the time above already.
 			case Command_Join:
@@ -402,6 +433,10 @@ func (s *serverConnection) receiveFromClientLoop() {
 				s.onWho(msg)
 			case Command_Ison:
 				s.onIson(msg)
+			case Command_Whois:
+				s.onWhois(msg)
+			case Command_Mode:
+				// Do nothing but suppress errors on clients.
 			default:
 				log.Print("Unknown message: ", msg)
 				s.enqueueLines(fmt.Sprintf("421 %s :Unknown command", msg.RawCommand))
