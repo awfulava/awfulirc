@@ -393,9 +393,9 @@ func (a *AwfulClient) ParseLepersColony(ctx context.Context) (*Posts, error) {
 			b.WriteString("\x01ACTION ")
 			b.WriteString(action)
 			b.WriteString(" ")
-			b.WriteString(target)
+			b.WriteString(AuthorToIRC(target))
 			b.WriteString(" (approved by ")
-			b.WriteString(approved)
+			b.WriteString(AuthorToIRC(approved))
 			b.WriteString(")\x01\n")
 			if postid != "0" {
 				b.WriteString(fmt.Sprintf("https://forums.somethingawful.com/showthread.php?goto=post&postid=%s&noseen=1\n", postid))
