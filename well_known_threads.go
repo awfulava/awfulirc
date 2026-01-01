@@ -7,9 +7,9 @@ package awfulirc
 // useful if it is a short unique string that will form the channel name.
 var WellKnownThreads = []ThreadMetadata{
 	{
-		ID:    4102933,
+		ID:    4103011,
 		Title: "awfulirc help and discussion",
-		Hint:  "help",
+		Hint:  "awfulirc",
 	},
 	{
 		ID:    4055683,
