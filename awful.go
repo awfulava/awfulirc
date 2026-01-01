@@ -380,13 +380,26 @@ func (a *AwfulClient) ParseLepersColony(ctx context.Context) (*Posts, error) {
 			// Should be unique enough for this.
 			id := posttime.Unix()*10000 + postidnum%10000
 
+			switch action {
+			case "PROBATION":
+				action = "probates"
+			case "BAN":
+				action = "bans"
+			case "PERMABAN":
+				action = "permabans"
+			}
+
 			var b strings.Builder
+			b.WriteString("\x01ACTION ")
 			b.WriteString(action)
-			b.WriteString(" for [")
+			b.WriteString(" ")
 			b.WriteString(target)
-			b.WriteString("] (approved by ")
+			b.WriteString(" (approved by ")
 			b.WriteString(approved)
-			b.WriteString(")\n")
+			b.WriteString(")\x01\n")
+			if postid != "0" {
+				b.WriteString(fmt.Sprintf("https://forums.somethingawful.com/showthread.php?goto=post&postid=%s&noseen=1\n", postid))
+			}
 			b.WriteString(reason)
 
 			posts = append(posts, Post{
