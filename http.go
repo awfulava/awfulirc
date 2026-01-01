@@ -27,7 +27,7 @@ func NewLimitedHTTPClient() (*LimitedHTTPClient, error) {
 		client: &http.Client{
 			Jar: jar,
 		},
-		limiter: rate.NewLimiter(rate.Every(time.Second), 1),
+		limiter: rate.NewLimiter(rate.Every(time.Second), 5),
 	}, nil
 }
 
