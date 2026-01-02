@@ -86,11 +86,17 @@ type ThreadMetadata struct {
 	// Title is the thread title, which may change regularly.
 	Title string
 
+	// Author is the original author of the thread.
+	Author string
+
 	// Replies is the number of replies in the thread.
 	Replies int64
 
 	// Updated is the last thread update time.
 	Updated time.Time
+
+	// KilledBy is the last poster of the thread.
+	KilledBy string
 
 	// Hint is a manually specified short name hint. See
 	// well_known_threads.go for hard-coded threads with hints based
@@ -352,6 +358,22 @@ type Posts struct {
 	Posts       []Post
 	CurrentPage int64
 	TotalPages  int64
+}
+
+func (a *AwfulClient) ParseForumThreads(ctx context.Context, forumid int) ([]ThreadMetadata, error) {
+	url := fmt.Sprintf("https://forums.somethingawful.com/forumdisplay.php?forumid=%d", forumid)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	th, err := a.parseThreadsFromResponse(res)
+	return th.Threads, err
 }
 
 // ParseLepersColony returns the lepers colony formatted as a sequence of
@@ -1484,9 +1506,14 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 		return ""
 	}
 
-	parseLastPost := func(lastpost *html.Node) time.Time {
+	parseLastPost := func(lastpost *html.Node) (time.Time, string) {
+		var (
+			timestamp time.Time
+			author    string
+		)
 		for n := range lastpost.ChildNodes() {
 			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+			Attributes:
 				for _, attr := range n.Attr {
 					if attr.Key == "class" && attr.Val == "date" {
 						for inner := range n.ChildNodes() {
@@ -1494,24 +1521,29 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 								for _, format := range []string{"15:04 Jan _2, 2006", "3:04 PM Jan _2, 2006"} {
 									parsed, err := time.Parse(format, strings.TrimSpace(inner.Data))
 									if err == nil {
-										return parsed
+										timestamp = parsed
+										continue Attributes
 									}
 								}
 							}
 						}
+					} else if attr.Key == "class" && attr.Val == "author" {
+						author = extractTextFromChild(n)
 					}
 				}
 			}
 		}
-		return time.Time{}
+		return timestamp, author
 	}
 
 	parseThread := func(thread *html.Node) {
 		var (
-			threadID       string
-			threadTitle    string
-			threadReplies  int64 = -1
-			threadLastPost time.Time
+			threadID         string
+			threadAuthor     string
+			threadTitle      string
+			threadReplies    int64 = -1
+			threadLastPost   time.Time
+			threadLastPoster string
 		)
 		for _, attr := range thread.Attr {
 			if attr.Key == "id" {
@@ -1532,10 +1564,12 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 				switch class {
 				case "title", "title title_sticky":
 					threadTitle = parseTitle(n)
+				case "author":
+					threadAuthor = extractTextFromDeepChild(n)
 				case "replies":
 					threadReplies = parseReplies(n)
 				case "lastpost":
-					threadLastPost = parseLastPost(n)
+					threadLastPost, threadLastPoster = parseLastPost(n)
 				}
 			}
 		}
@@ -1547,11 +1581,19 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 					errs = append(errs, fmt.Errorf("unable to parse thread: %v", err))
 					return
 				}
+
+				// Not always populated (for announcements, for example)
+				if threadLastPoster == "" {
+					threadLastPoster = threadAuthor
+				}
+
 				repr := ThreadMetadata{
-					ID:      threadNumber,
-					Title:   threadTitle,
-					Replies: threadReplies,
-					Updated: threadLastPost,
+					ID:       threadNumber,
+					Title:    threadTitle,
+					Author:   threadAuthor,
+					Replies:  threadReplies,
+					Updated:  threadLastPost,
+					KilledBy: threadLastPoster,
 				}
 
 				threads.Threads = append(threads.Threads, repr)
@@ -1599,9 +1641,17 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 	}
 
 	parseContent := func(content *html.Node) {
+		// In the bookmarks view there is a form. In regular forum
+		// view there is not.
 		for n := range content.ChildNodes() {
 			if n.Type == html.ElementNode && n.DataAtom == atom.Form {
 				parseForm(n)
+			} else if n.Type == html.ElementNode && n.DataAtom == atom.Table {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "forum" {
+						parseForum(n)
+					}
+				}
 			}
 		}
 	}
@@ -1619,6 +1669,21 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 	}
 
 	parseBody := func(body *html.Node) {
+
+	FindNestedUsergroup:
+		// In the regular forum page, there is a usergroup nesting. On
+		// bookmarks there is not.
+		for n := range body.ChildNodes() {
+			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+				for _, attr := range n.Attr {
+					if attr.Key == "id" && attr.Val == "usergroup" {
+						body = n
+						break FindNestedUsergroup
+					}
+				}
+			}
+		}
+
 		for n := range body.ChildNodes() {
 			if n.Type == html.ElementNode && n.DataAtom == atom.Div {
 				for _, attr := range n.Attr {

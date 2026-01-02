@@ -32,6 +32,7 @@ type serverConnection struct {
 	realname string
 
 	threads map[string]*threadRepresentation
+	forums  map[string]*forumRepresentation
 
 	registered bool
 
@@ -225,46 +226,81 @@ func (s *serverConnection) onJoin(msg *ClientMessage) {
 
 	channels := strings.Split(msg.Parameters[0], ",")
 	for _, ch := range channels {
-		if !strings.HasPrefix(ch, "#") || ch == "#" {
+		if strings.HasPrefix(ch, "#") && !strings.HasPrefix(ch, "##") && ch != "#" {
+			unprefixedChannel := string(ch[1:])
+			if got := s.threads[unprefixedChannel]; got != nil {
+				continue
+			}
+
+			// Since this is not general-purpose IRC, just fail if it's
+			// not a channel we're tracking. The server doesn't handle IRC
+			// user communication.
+			s.server.lock.Lock()
+			thread := s.server.shortNames[unprefixedChannel]
+			s.server.lock.Unlock()
+			if thread == nil {
+				s.enqueueNoSuchChannel(ch)
+				continue
+			}
+
+			s.server.startThreadListener(thread)
+
+			// Thread exists. Add the bidirectional mapping between
+			// connected client and subscribed thread.
+			s.threads[unprefixedChannel] = thread
+			thread.lock.Lock()
+			thread.subscribers[s] = struct{}{}
+
+			// Broadcast the topic and members to the user.
+			s.enqueueLines(fmt.Sprintf(":%s!%s@%s JOIN %s", s.nick, s.user, s.host, ch))
+			s.enqueueChannelTopic(ch, thread.meta.Title)
+			s.enqueueChannelMembers(ch, thread.authors)
+
+			// Broadcast all initial messages to the user.
+			for _, p := range thread.posts {
+				author := AuthorToIRC(p.Author)
+				s.enqueueLines(MessageToIRC(author, ch, p.Body)...)
+			}
+			thread.lock.Unlock()
+		} else if strings.HasPrefix(ch, "##") && ch != "##" {
+			unprefixedChannel := string(ch[2:])
+			if got := s.forums[unprefixedChannel]; got != nil {
+				continue
+			}
+
+			// Since this is not general-purpose IRC, just fail if it's
+			// not a channel we're tracking. The server doesn't handle IRC
+			// user communication.
+			s.server.lock.Lock()
+			forum := s.server.forumNames[unprefixedChannel]
+			s.server.lock.Unlock()
+			if forum == nil {
+				s.enqueueNoSuchChannel(ch)
+				continue
+			}
+
+			s.server.startForumListener(forum)
+
+			// Thread exists. Add the bidirectional mapping between
+			// connected client and subscribed thread.
+			s.forums[unprefixedChannel] = forum
+			forum.lock.Lock()
+			forum.subscribers[s] = struct{}{}
+
+			// Broadcast the topic and members to the user.
+			s.enqueueLines(fmt.Sprintf(":%s!%s@%s JOIN %s", s.nick, s.user, s.host, ch))
+			s.enqueueChannelTopic(ch, forum.name)
+			s.enqueueChannelMembers(ch, forum.authors)
+
+			// Broadcast all initial messages to the user.
+			for _, p := range forum.threads {
+				ircPost := formatThreadPostUpdate(p, ch)
+				s.enqueueLines(ircPost...)
+			}
+			forum.lock.Unlock()
+		} else {
 			s.enqueueNoSuchChannel(ch)
-			continue
 		}
-
-		unprefixedChannel := string(ch[1:])
-		if got := s.threads[unprefixedChannel]; got != nil {
-			continue
-		}
-
-		// Since this is not general-purpose IRC, just fail if it's
-		// not a channel we're tracking. The server doesn't handle IRC
-		// user communication.
-		s.server.lock.Lock()
-		thread := s.server.shortNames[unprefixedChannel]
-		s.server.lock.Unlock()
-		if thread == nil {
-			s.enqueueNoSuchChannel(ch)
-			continue
-		}
-
-		s.server.startThreadListener(thread)
-
-		// Thread exists. Add the bidirectional mapping between
-		// connected client and subscribed thread.
-		s.threads[unprefixedChannel] = thread
-		thread.lock.Lock()
-		thread.subscribers[s] = struct{}{}
-
-		// Broadcast the topic and members to the user.
-		s.enqueueLines(fmt.Sprintf(":%s!%s@%s JOIN %s", s.nick, s.user, s.host, ch))
-		s.enqueueChannelTopic(ch, thread.meta.Title)
-		s.enqueueChannelMembers(ch, thread.authors)
-
-		// Broadcast all initial messages to the user.
-		for _, p := range thread.posts {
-			author := AuthorToIRC(p.Author)
-			s.enqueueLines(MessageToIRC(author, ch, p.Body)...)
-		}
-		thread.lock.Unlock()
 	}
 }
 
@@ -278,12 +314,15 @@ func (s *serverConnection) enqueueChannelMembers(ch string, authors map[string]s
 func (s *serverConnection) onList(msg *ClientMessage) {
 	// Send only information about requested channels.
 	// TODO: Not tested.
-	var it iter.Seq2[string, *threadRepresentation]
+	var (
+		it  iter.Seq2[string, *threadRepresentation]
+		fit iter.Seq2[string, *forumRepresentation]
+	)
 	if len(msg.Parameters) > 0 {
 		chans := strings.Split(msg.Parameters[0], ",")
 		it = func(yield func(string, *threadRepresentation) bool) {
 			for _, ch := range chans {
-				if strings.HasPrefix(ch, "#") && len(ch) > 1 {
+				if strings.HasPrefix(ch, "#") && !strings.HasPrefix(ch, "##") && len(ch) > 1 {
 					name := string(ch[1:])
 					if got, ok := s.server.shortNames[name]; ok {
 						next := yield(name, got)
@@ -294,17 +333,36 @@ func (s *serverConnection) onList(msg *ClientMessage) {
 				}
 			}
 		}
+		fit = func(yield func(string, *forumRepresentation) bool) {
+			for _, ch := range chans {
+				if strings.HasPrefix(ch, "##") && len(ch) > 2 {
+					name := string(ch[2:])
+					if got, ok := s.server.forumNames[name]; ok {
+						next := yield(name, got)
+						if !next {
+							return
+						}
+					}
+				}
+			}
+		}
 	} else {
 		it = maps.All(s.server.shortNames)
+		fit = maps.All(s.server.forumNames)
 	}
 
 	s.enqueueLines(fmt.Sprintf("321 %s Channel :Users  Name", s.nickArgument()))
 	s.server.lock.RLock()
 	for name, rep := range it {
-		m := fmt.Sprintf("322 %s #%s 0 :%s", s.nickArgument(), name, rep.meta.Title)
+		m := fmt.Sprintf("322 %s #%s %d :%s", s.nickArgument(), name, rep.meta.Replies, rep.meta.Title)
+		s.enqueueLines(m)
+	}
+	for name, rep := range fit {
+		m := fmt.Sprintf("322 %s ##%s %d :%s", s.nickArgument(), name, len(rep.threads), rep.name)
 		s.enqueueLines(m)
 	}
 	s.server.lock.RUnlock()
+
 	s.enqueueLines(fmt.Sprintf("323 %s :End of /LIST", s.nickArgument()))
 }
 
@@ -431,7 +489,7 @@ func (s *serverConnection) onPart(msg *ClientMessage) {
 		return
 	}
 	for ch := range strings.SplitSeq(msg.Parameters[0], ",") {
-		if strings.HasPrefix(ch, "#") && len(ch) > 1 {
+		if strings.HasPrefix(ch, "#") && !strings.HasPrefix(ch, "##") && len(ch) > 1 {
 			shortName := string(ch[1:])
 			if _, ok := s.threads[shortName]; !ok {
 				s.enqueueLines(fmt.Sprintf("442 %s %s :You're not on that channel", s.nick, ch))
@@ -443,6 +501,20 @@ func (s *serverConnection) onPart(msg *ClientMessage) {
 			delete(got.subscribers, s)
 			got.lock.Unlock()
 			delete(s.threads, shortName)
+
+			s.enqueueLines(fmt.Sprintf(":%s PART %s", s.nick, ch))
+		} else if strings.HasPrefix(ch, "##") && len(ch) > 2 {
+			shortName := string(ch[2:])
+			if _, ok := s.forums[shortName]; !ok {
+				s.enqueueLines(fmt.Sprintf("442 %s %s :You're not on that channel", s.nick, ch))
+				continue
+			}
+
+			got := s.server.forumNames[shortName]
+			got.lock.Lock()
+			delete(got.subscribers, s)
+			got.lock.Unlock()
+			delete(s.forums, shortName)
 
 			s.enqueueLines(fmt.Sprintf(":%s PART %s", s.nick, ch))
 		} else {

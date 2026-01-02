@@ -23,3 +23,17 @@ func extractTextFromChild(node *html.Node) string {
 	}
 	return ""
 }
+
+func extractTextFromDeepChild(node *html.Node) string {
+	n := node
+	for n.Type != html.TextNode {
+		for child := range n.ChildNodes() {
+			n = child
+			break
+		}
+	}
+	if n.Type == html.TextNode {
+		return strings.TrimSpace(n.Data)
+	}
+	return ""
+}

@@ -18,3 +18,16 @@ type threadRepresentation struct {
 
 	subscribers map[*serverConnection]struct{}
 }
+
+type forumRepresentation struct {
+	forumid   int
+	name      string
+	shortName string
+
+	lock        sync.Mutex
+	threads     map[int64]ThreadMetadata
+	seen        map[int64]struct{}
+	authors     map[string]struct{}
+	subscribers map[*serverConnection]struct{}
+	listening   bool
+}
