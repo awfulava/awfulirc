@@ -125,10 +125,13 @@ func (s *Server) startThreadListenerWithPostGetter(thread *threadRepresentation,
 			p, err := pg(ctx, thread)
 			if err != nil {
 				log.Print(err)
-				// TODO: Remove all subscribers in error cases. Right
-				// now assume nothing bad happens with local
-				// connections.
-				return
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Minute):
+					// Connection was interrupted; try again later.
+					continue
+				}
 			}
 
 			thread.lock.Lock()
@@ -290,6 +293,12 @@ func (s *Server) repeatUpdatingPrivateMessages() {
 		pms, err := s.client.ParsePrivateMessages(s.ctx)
 		if err != nil {
 			log.Print("ParsePrivateMessages: ", err)
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(time.Minute):
+				continue
+			}
 		}
 
 		// PMs are listed in descending order. Form the list in
@@ -369,6 +378,11 @@ func (s *Server) repeatUpdatingThreads() {
 		updated, err := s.client.ParseRecentBookmarks(s.ctx)
 		if err != nil {
 			log.Print("ParseRecentBookmarks:", err)
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(time.Minute):
+			}
 		}
 		s.updateThreads(updated)
 	}

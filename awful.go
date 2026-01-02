@@ -1448,7 +1448,7 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 				}
 
 				switch class {
-				case "title":
+				case "title", "title title_sticky":
 					threadTitle = parseTitle(n)
 				case "replies":
 					threadReplies = parseReplies(n)
