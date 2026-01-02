@@ -34,6 +34,7 @@ type Server struct {
 	connections         map[*serverConnection]struct{}
 	forums              map[int64]*forumRepresentation
 	forumNames          map[string]*forumRepresentation
+	bookmarks           *forumRepresentation
 }
 
 // Listen starts an IRC bridge with the given somethingawful.com
@@ -47,6 +48,17 @@ func Listen(ctx context.Context, client *AwfulClient, name, addr string) (*Serve
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("Listen: %w", err)
+	}
+
+	fr := &forumRepresentation{
+		forumid:     -1,
+		name:        "Bookmarks",
+		shortName:   "bookmarks",
+		threads:     make(map[int64]ThreadMetadata),
+		seen:        make(map[int64]struct{}),
+		authors:     make(map[string]struct{}),
+		subscribers: make(map[*serverConnection]struct{}),
+		listening:   true,
 	}
 
 	s := &Server{
@@ -68,7 +80,9 @@ func Listen(ctx context.Context, client *AwfulClient, name, addr string) (*Serve
 		seenPrivateMessages: make(map[int64]struct{}),
 
 		connections: make(map[*serverConnection]struct{}),
+		bookmarks:   fr,
 	}
+	s.forumNames["bookmarks"] = fr
 
 	func() {
 		tr := &threadRepresentation{
@@ -78,6 +92,7 @@ func Listen(ctx context.Context, client *AwfulClient, name, addr string) (*Serve
 			},
 			shortName:   "lc",
 			subscribers: make(map[*serverConnection]struct{}),
+			listening:   true,
 		}
 		s.shortNames["lc"] = tr
 		go s.repeatUpdatingLC(tr)
@@ -89,6 +104,43 @@ func Listen(ctx context.Context, client *AwfulClient, name, addr string) (*Serve
 	go s.loop()
 
 	return s, nil
+}
+
+func (s *Server) updateForumFromThreads(forum *forumRepresentation, threads []ThreadMetadata) {
+	forum.lock.Lock()
+	defer forum.lock.Unlock()
+	joined := make(map[string]struct{})
+	var updates []ThreadMetadata
+	for _, th := range threads {
+		auth := AuthorToIRC(th.KilledBy)
+		if _, ok := forum.authors[auth]; !ok {
+			joined[auth] = struct{}{}
+		}
+		forum.authors[auth] = struct{}{}
+
+		// If the thread is new or the update time has
+		// changed, queue an update.
+		existing, ok := forum.threads[th.ID]
+		if !ok || !existing.Updated.Equal(th.Updated) {
+			updates = append(updates, th)
+		}
+		forum.threads[th.ID] = th
+	}
+
+	// Consider the new author to have joined if we see a new post from them.
+	for auth := range joined {
+		joinMessage := fmt.Sprintf(":%s!%s@somethingawful.com JOIN ##%s", auth, auth, forum.shortName)
+		for sub := range forum.subscribers {
+			sub.enqueueLines(joinMessage)
+		}
+	}
+
+	for _, u := range updates {
+		ircPost := formatThreadPostUpdate(u, "##"+forum.shortName)
+		for sub := range forum.subscribers {
+			sub.enqueueLines(ircPost...)
+		}
+	}
 }
 
 func (s *Server) startForumListener(forum *forumRepresentation) {
@@ -117,40 +169,7 @@ func (s *Server) startForumListener(forum *forumRepresentation) {
 				}
 			}
 
-			forum.lock.Lock()
-			joined := make(map[string]struct{})
-			var updates []ThreadMetadata
-			for _, th := range threads {
-				auth := AuthorToIRC(th.KilledBy)
-				if _, ok := forum.authors[auth]; !ok {
-					joined[auth] = struct{}{}
-				}
-				forum.authors[auth] = struct{}{}
-
-				// If the thread is new or the update time has
-				// changed, queue an update.
-				existing, ok := forum.threads[th.ID]
-				if !ok || !existing.Updated.Equal(th.Updated) {
-					updates = append(updates, th)
-				}
-				forum.threads[th.ID] = th
-			}
-
-			// Consider the new author to have joined if we see a new post from them.
-			for auth := range joined {
-				joinMessage := fmt.Sprintf(":%s!%s@somethingawful.com JOIN &%s", auth, auth, forum.shortName)
-				for sub := range forum.subscribers {
-					sub.enqueueLines(joinMessage)
-				}
-			}
-
-			for _, u := range updates {
-				ircPost := formatThreadPostUpdate(u, "##"+forum.shortName)
-				for sub := range forum.subscribers {
-					sub.enqueueLines(ircPost...)
-				}
-			}
-			forum.lock.Unlock()
+			s.updateForumFromThreads(forum, threads)
 
 			select {
 			case <-ctx.Done():
@@ -338,6 +357,8 @@ func (s *Server) lockedMakeShortName(title string) string {
 // Threads are persistent for each server invocation by thread ID, so
 // title changes won't result in new channel names.
 func (s *Server) updateThreads(threads []ThreadMetadata) {
+	s.updateForumFromThreads(s.bookmarks, threads)
+
 	for _, th := range threads {
 		s.lock.Lock()
 		got, ok := s.threads[th.ID]
@@ -370,6 +391,7 @@ func (s *Server) updateThreads(threads []ThreadMetadata) {
 			s.threads[th.ID] = repr
 			s.shortNames[repr.shortName] = repr
 		}
+
 		s.lock.Unlock()
 	}
 }
