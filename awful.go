@@ -1527,7 +1527,11 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 								}
 							}
 						}
-					} else if attr.Key == "class" && attr.Val == "author" {
+					}
+				}
+			} else if n.Type == html.ElementNode && n.DataAtom == atom.A {
+				for _, attr := range n.Attr {
+					if attr.Key == "class" && attr.Val == "author" {
 						author = extractTextFromChild(n)
 					}
 				}

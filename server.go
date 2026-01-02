@@ -167,8 +167,8 @@ func formatThreadPostUpdate(u ThreadMetadata, ch string) []string {
 	var b strings.Builder
 	b.WriteString("\x01ACTION posted in: ")
 	b.WriteString(u.Title)
-	b.WriteString("\x01\n")
-	b.WriteString(fmt.Sprintf("https://forums.somethingawful.com/showthread.php?threadid=%d&goto=lastpost", u.ID))
+	b.WriteString(" (")
+	b.WriteString(fmt.Sprintf("https://forums.somethingawful.com/showthread.php?threadid=%d&goto=lastpost)\x01", u.ID))
 	return MessageToIRC(author, ch, b.String())
 }
 

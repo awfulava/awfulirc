@@ -289,7 +289,7 @@ func (s *serverConnection) onJoin(msg *ClientMessage) {
 
 			// Broadcast the topic and members to the user.
 			s.enqueueLines(fmt.Sprintf(":%s!%s@%s JOIN %s", s.nick, s.user, s.host, ch))
-			s.enqueueChannelTopic(ch, forum.name)
+			s.enqueueChannelTopic(ch, fmt.Sprintf("%s (https://forums.somethingawful.com/forumdisplay.php?forumid=%d)", forum.name, forum.forumid))
 			s.enqueueChannelMembers(ch, forum.authors)
 
 			// Broadcast all initial messages to the user.
