@@ -140,7 +140,11 @@ func (s *Server) updateForumFromThreads(forum *forumRepresentation, threads []Th
 	}
 
 	for _, u := range updates {
-		ircPost := formatThreadPostUpdate(u, "##"+forum.shortName)
+		var shortName string
+		if known := s.threads[u.ID]; known != nil {
+			shortName = known.shortName
+		}
+		ircPost := formatThreadPostUpdate(u, "##"+forum.shortName, shortName)
 		for sub := range forum.subscribers {
 			sub.enqueueLines(ircPost...)
 		}
@@ -185,13 +189,17 @@ func (s *Server) startForumListener(forum *forumRepresentation) {
 	forum.listening = true
 }
 
-func formatThreadPostUpdate(u ThreadMetadata, ch string) []string {
+func formatThreadPostUpdate(u ThreadMetadata, ch string, shortName string) []string {
 	author := AuthorToIRC(u.KilledBy)
 	var b strings.Builder
 	b.WriteString("\x01ACTION posted in: ")
 	b.WriteString(u.Title)
 	b.WriteString(" (")
-	b.WriteString(fmt.Sprintf("https://forums.somethingawful.com/showthread.php?threadid=%d&goto=lastpost)\x01", u.ID))
+	if shortName != "" {
+		b.WriteString(fmt.Sprintf("https://forums.somethingawful.com/showthread.php?threadid=%d&goto=lastpost) [#%s]\x01", u.ID, shortName))
+	} else {
+		b.WriteString(fmt.Sprintf("https://forums.somethingawful.com/showthread.php?threadid=%d&goto=lastpost)\x01", u.ID))
+	}
 	return MessageToIRC(author, ch, b.String())
 }
 

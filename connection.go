@@ -294,7 +294,13 @@ func (s *serverConnection) onJoin(msg *ClientMessage) {
 
 			// Broadcast all initial messages to the user.
 			for _, p := range forum.threads {
-				ircPost := formatThreadPostUpdate(p, ch)
+				var channelShortName string
+				s.server.lock.Lock()
+				if known := s.server.threads[p.ID]; known != nil {
+					channelShortName = known.shortName
+				}
+				s.server.lock.Unlock()
+				ircPost := formatThreadPostUpdate(p, ch, channelShortName)
 				s.enqueueLines(ircPost...)
 			}
 			forum.lock.Unlock()
