@@ -425,6 +425,33 @@ func (s *serverConnection) onPing(msg *ClientMessage) {
 	s.enqueueLines(fmt.Sprintf("PONG %s :%s", s.server.name, msg.Parameters[0]))
 }
 
+func (s *serverConnection) onPart(msg *ClientMessage) {
+	if len(msg.Parameters) == 0 {
+		s.enqueueNeedMoreParams("PART")
+		return
+	}
+	for ch := range strings.SplitSeq(msg.Parameters[0], ",") {
+		if strings.HasPrefix(ch, "#") && len(ch) > 1 {
+			shortName := string(ch[1:])
+			if _, ok := s.threads[shortName]; !ok {
+				s.enqueueLines(fmt.Sprintf("442 %s %s :You're not on that channel", s.nick, ch))
+				continue
+			}
+
+			got := s.server.shortNames[shortName]
+			got.lock.Lock()
+			delete(got.subscribers, s)
+			got.lock.Unlock()
+			delete(s.threads, shortName)
+
+			s.enqueueLines(fmt.Sprintf(":%s PART %s", s.nick, ch))
+		} else {
+			s.enqueueLines(fmt.Sprintf("442 %s %s :No such channel", s.nick, ch))
+			continue
+		}
+	}
+}
+
 func (s *serverConnection) receiveFromClientLoop() {
 	it := NewClientMessageIterator(s.conn)
 	for msg, err := range it {
@@ -457,6 +484,8 @@ func (s *serverConnection) receiveFromClientLoop() {
 				s.onWhois(msg)
 			case Command_Mode:
 				// Do nothing but suppress errors on clients.
+			case Command_Part:
+				s.onPart(msg)
 			default:
 				log.Print("Unknown message: ", msg)
 				s.enqueueLines(fmt.Sprintf("421 %s :Unknown command", msg.RawCommand))
