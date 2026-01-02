@@ -205,9 +205,91 @@ func NormalizePost(post *html.Node) string {
 				builder.WriteString(href)
 				builder.WriteString(")")
 			}
+		} else if n.Type == html.ElementNode && n.DataAtom == atom.Img {
+			var (
+				src string
+				alt string
+			)
+			for _, attr := range n.Attr {
+				switch attr.Key {
+				case "src":
+					src = attr.Val
+				case "alt":
+					alt = attr.Val
+				}
+			}
+			if alt != "" {
+				builder.WriteString(alt)
+			} else {
+				builder.WriteString(src)
+			}
+		} else if n.Type == html.ElementNode && n.DataAtom == atom.Span {
+			for _, attr := range n.Attr {
+				switch attr.Key {
+				case "class":
+					switch attr.Val {
+					case "timg_container":
+						for img := range n.ChildNodes() {
+							if img.Type == html.ElementNode && img.DataAtom == atom.Img {
+								for _, attr := range img.Attr {
+									if attr.Key == "src" {
+										builder.WriteString(attr.Val)
+										break
+									}
+								}
+							}
+						}
+					}
+
+				}
+			}
+		} else if n.Type == html.ElementNode && n.DataAtom == atom.P {
+			builder.WriteString("\n")
+			origLen := builder.Len()
+			for _, attr := range n.Attr {
+				switch attr.Key {
+				case "class":
+					switch attr.Val {
+					case "attachment":
+						for img := range n.ChildNodes() {
+							if img.Type == html.ElementNode && img.DataAtom == atom.Img {
+								for _, attr := range img.Attr {
+									if attr.Key == "src" {
+										builder.WriteString("https://forums.somethingawful.com/")
+										builder.WriteString(attr.Val)
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if builder.Len() != origLen {
+				builder.WriteString("\n")
+			}
+		} else if n.Type == html.ElementNode && n.DataAtom == atom.Strong {
+			txt := extractTextFromChild(n)
+			if txt != "" {
+				builder.WriteString("*")
+				builder.WriteString(txt)
+				builder.WriteString("*")
+			}
+		} else if n.Type == html.ElementNode && n.DataAtom == atom.I {
+			txt := extractTextFromChild(n)
+			if txt != "" {
+				builder.WriteString("/")
+				builder.WriteString(txt)
+				builder.WriteString("/")
+			}
 		}
 	}
-	return strings.ReplaceAll(strings.TrimSpace(builder.String()), "\n\n", "\n")
+
+	val := builder.String()
+	for strings.Contains(val, "\n\n") {
+		val = strings.ReplaceAll(strings.TrimSpace(val), "\n\n", "\n")
+	}
+	return quoteReplacer.Replace(val)
 }
 
 // MessageToIRC converts a post into a sequence of PRIVMSG messages that
