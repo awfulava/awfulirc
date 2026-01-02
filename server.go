@@ -92,7 +92,6 @@ func Listen(ctx context.Context, client *AwfulClient, name, addr string) (*Serve
 			},
 			shortName:   "lc",
 			subscribers: make(map[*serverConnection]struct{}),
-			listening:   true,
 		}
 		s.shortNames["lc"] = tr
 		go s.repeatUpdatingLC(tr)
@@ -107,8 +106,6 @@ func Listen(ctx context.Context, client *AwfulClient, name, addr string) (*Serve
 }
 
 func (s *Server) updateForumFromThreads(forum *forumRepresentation, threads []ThreadMetadata) {
-	forum.lock.Lock()
-	defer forum.lock.Unlock()
 	joined := make(map[string]struct{})
 	var updates []ThreadMetadata
 	for _, th := range threads {
@@ -251,7 +248,6 @@ func (s *Server) startThreadListenerWithPostGetter(thread *threadRepresentation,
 				}
 			}
 
-			thread.lock.Lock()
 			origLen := len(thread.posts)
 			joined := make(map[string]struct{})
 			for _, post := range p.Posts {
@@ -283,7 +279,6 @@ func (s *Server) startThreadListenerWithPostGetter(thread *threadRepresentation,
 					sub.enqueueLines(ircPost...)
 				}
 			}
-			thread.lock.Unlock()
 
 			select {
 			case <-ctx.Done():
@@ -369,7 +364,9 @@ func (s *Server) lockedMakeShortName(title string) string {
 // Threads are persistent for each server invocation by thread ID, so
 // title changes won't result in new channel names.
 func (s *Server) updateThreads(threads []ThreadMetadata) {
+	s.lock.Lock()
 	s.updateForumFromThreads(s.bookmarks, threads)
+	s.lock.Unlock()
 
 	for _, th := range threads {
 		s.lock.Lock()
