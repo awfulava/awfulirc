@@ -127,6 +127,10 @@ func (s *Server) updateForumFromThreads(forum *forumRepresentation, threads []Th
 		forum.threads[th.ID] = th
 	}
 
+	slices.SortFunc(updates, func(lhs, rhs ThreadMetadata) int {
+		return lhs.Updated.Compare(rhs.Updated)
+	})
+
 	// Consider the new author to have joined if we see a new post from them.
 	for auth := range joined {
 		joinMessage := fmt.Sprintf(":%s!%s@somethingawful.com JOIN ##%s", auth, auth, forum.shortName)
