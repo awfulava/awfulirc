@@ -6,7 +6,8 @@
 
 Example:
 
-	go run . --username "username" --password "password"
+		go run . --username "username" --password "password"
+	    go run . --authfile "some-token-file"
 */
 package main
 
@@ -15,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/awfulava/awfulirc"
@@ -25,13 +27,34 @@ var (
 	name     = flag.String("name", "awfulirc", "server name")
 	username = flag.String("username", "", "login")
 	password = flag.String("password", "", "password")
+	authFile = flag.String("authfile", "", "auth file. see README.md")
 )
 
 func main() {
 	flag.Parse()
 	ctx := context.Background()
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
-	_, err := awfulirc.Listen(ctx, *username, *password, *name, addr)
+
+	ac, err := awfulirc.NewAwfulClient()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *authFile != "" {
+		func() {
+			r, err := os.Open(*authFile)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer r.Close()
+			if err := ac.SetAuthCookies(r); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	} else if err := ac.Login(ctx, *username, *password); err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = awfulirc.Listen(ctx, ac, *name, addr)
 	log.Printf("Listening on irc://%s", addr)
 	if err != nil {
 		log.Fatal(err)

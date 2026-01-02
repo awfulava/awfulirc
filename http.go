@@ -1,10 +1,15 @@
 package awfulirc
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -43,4 +48,56 @@ func (c *LimitedHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	case <-time.After(r.Delay()):
 		return c.client.Do(req)
 	}
+}
+
+func ParseNetscapeCookieFile(r io.Reader, jar http.CookieJar) error {
+	s := bufio.NewScanner(r)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 7 {
+			continue
+		}
+		for i, f := range fields {
+			fields[i] = strings.TrimSpace(f)
+		}
+
+		secure, err := strconv.ParseBool(fields[3])
+		if err != nil {
+			return err
+		}
+
+		expires, err := strconv.ParseInt(fields[4], 10, 64)
+		if err != nil {
+			return err
+		}
+
+		cookie := &http.Cookie{
+			Domain:  fields[0],
+			Path:    fields[2],
+			Name:    fields[5],
+			Secure:  secure,
+			Expires: time.Unix(expires, 0),
+			Value:   fields[6],
+		}
+
+		scheme := "http"
+		if cookie.Secure {
+			scheme = "https"
+		}
+
+		u := &url.URL{
+			Scheme: scheme,
+			Host:   cookie.Domain,
+		}
+
+		cookies := jar.Cookies(u)
+		cookies = append(cookies, cookie)
+		jar.SetCookies(u, cookies)
+
+	}
+	return s.Err()
 }

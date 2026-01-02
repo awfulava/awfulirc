@@ -21,8 +21,6 @@ import (
 type Server struct {
 	name string
 
-	username string
-
 	listener net.Listener
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -39,18 +37,8 @@ type Server struct {
 // Listen starts an IRC bridge with the given somethingawful.com
 // credentials, IRC server name, and listen address. The address is
 // usually 127.0.0.1:<port>. Use non-local IP masks at your peril.
-func Listen(ctx context.Context, username, password, name, addr string) (*Server, error) {
+func Listen(ctx context.Context, client *AwfulClient, name, addr string) (*Server, error) {
 	ctx, cancel := context.WithCancel(ctx)
-
-	client, err := NewAwfulClient()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	if err := client.Login(ctx, username, password); err != nil {
-		cancel()
-		return nil, err
-	}
 
 	var config net.ListenConfig
 	l, err := config.Listen(ctx, "tcp", addr)
@@ -75,7 +63,6 @@ func Listen(ctx context.Context, username, password, name, addr string) (*Server
 		privateMessages:     make(map[string][]string),
 		seenPrivateMessages: make(map[int64]struct{}),
 
-		username:    username,
 		connections: make(map[*serverConnection]struct{}),
 	}
 

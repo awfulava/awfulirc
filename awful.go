@@ -25,9 +25,12 @@ type AwfulClient struct {
 	client *LimitedHTTPClient
 }
 
-// NewAwfulClient returns an empty client that has not been logged in yet. Some
-// operations should work without logging in, but that flow has not been tested
-// much, so you probably want to Login immediately after construction.
+// NewAwfulClient returns an empty client that has not been logged in
+// yet. Some operations should work without logging in, but that flow
+// has not been tested much, so you probably want to Login immediately
+// after construction. As an alterantive to passing plaintext
+// credentials to the client, you can first get cookies and then set
+// the auth from the cookies file. See README.md.
 func NewAwfulClient() (*AwfulClient, error) {
 	hc, err := NewLimitedHTTPClient()
 	if err != nil {
@@ -36,6 +39,10 @@ func NewAwfulClient() (*AwfulClient, error) {
 	return &AwfulClient{
 		client: hc,
 	}, nil
+}
+
+func (a *AwfulClient) SetAuthCookies(r io.Reader) error {
+	return ParseNetscapeCookieFile(r, a.client.client.Jar)
 }
 
 // Login logs in with the given credentials.
