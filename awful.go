@@ -18,6 +18,8 @@ import (
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
+	"golang.org/x/net/html/charset"
+	"golang.org/x/text/transform"
 )
 
 // AwfulClient accesses and parses somethingawful.com.
@@ -69,10 +71,14 @@ func (a *AwfulClient) Login(ctx context.Context, username, password string) erro
 		return fmt.Errorf("unable to send login request: %w", err)
 	}
 	defer loginResponse.Body.Close()
+	body, err := convertToUtf8(loginResponse.Body)
+	if err != nil {
+		return err
+	}
 	// TODO: Looks like we may need to parse the output since we always get
 	// 200. Figure this out later.
 	if loginResponse.StatusCode != http.StatusOK {
-		io.Copy(os.Stdout, loginResponse.Body)
+		io.Copy(os.Stdout, body)
 		return fmt.Errorf("login failed for username %q", username)
 	}
 	return nil
@@ -176,6 +182,7 @@ func IRCToAuthor(irc string) string {
 // IRC-delimited lines.
 func NormalizePost(post *html.Node) string {
 	var builder strings.Builder
+NormalizeNodes:
 	for n := range post.ChildNodes() {
 		if n.Type == html.TextNode {
 			builder.WriteString(n.Data)
@@ -288,6 +295,29 @@ func NormalizePost(post *html.Node) string {
 				builder.WriteString(txt)
 				builder.WriteString("/")
 			}
+		} else if n.Type == html.ElementNode && n.DataAtom == atom.Div {
+			for _, attr := range n.Attr {
+				if attr.Key == "class" && attr.Val == "bbc-block" {
+					for h4 := range n.ChildNodes() {
+						if h4.Type == html.ElementNode && h4.DataAtom == atom.H4 {
+							author := strings.TrimSuffix(extractTextFromDeepChild(h4), " posted:")
+							builder.WriteString(AuthorToIRC(author))
+							builder.WriteString(": ")
+							continue NormalizeNodes
+						}
+					}
+				} else if attr.Key == "class" && attr.Val == "bbc-block code" {
+					for pre := range n.ChildNodes() {
+						if pre.Type == html.ElementNode && pre.DataAtom == atom.Pre {
+							builder.WriteString(extractTextFromDeepChild(pre))
+							continue NormalizeNodes
+						}
+					}
+				}
+			}
+
+			fmt.Println("New type of div needs to be handled:")
+			html.Render(os.Stdout, n)
 		}
 	}
 
@@ -295,7 +325,7 @@ func NormalizePost(post *html.Node) string {
 	for strings.Contains(val, "\n\n") {
 		val = strings.ReplaceAll(strings.TrimSpace(val), "\n\n", "\n")
 	}
-	return quoteReplacer.Replace(val)
+	return val
 }
 
 // MessageToIRC converts a post into a sequence of PRIVMSG messages that
@@ -360,6 +390,15 @@ type Posts struct {
 	TotalPages  int64
 }
 
+func convertToUtf8(r io.Reader) (io.Reader, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	e, _, _ := charset.DetermineEncoding(b, "")
+	return transform.NewReader(bytes.NewReader(b), e.NewDecoder()), nil
+}
+
 func (a *AwfulClient) ParseForumThreads(ctx context.Context, forumid int) ([]ThreadMetadata, error) {
 	url := fmt.Sprintf("https://forums.somethingawful.com/forumdisplay.php?forumid=%d", forumid)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -393,7 +432,8 @@ func (a *AwfulClient) ParseLepersColony(ctx context.Context) (*Posts, error) {
 		return nil, fmt.Errorf("get failed with status: %v", res.StatusCode)
 	}
 
-	doc, err := html.Parse(res.Body)
+	body, err := convertToUtf8(res.Body)
+	doc, err := html.Parse(body)
 	if err != nil {
 		return nil, err
 	}
@@ -522,7 +562,6 @@ func (a *AwfulClient) ParseLepersColony(ctx context.Context) (*Posts, error) {
 				Author: requested,
 				Body:   b.String(),
 			})
-
 		}
 	}
 
@@ -706,8 +745,11 @@ func (a *AwfulClient) ReplyToThread(ctx context.Context, thread ThreadMetadata, 
 		return err
 	}
 	defer res.Body.Close()
-
-	doc, err := html.Parse(res.Body)
+	body, err := convertToUtf8(res.Body)
+	if err != nil {
+		return err
+	}
+	doc, err := html.Parse(body)
 	if err != nil {
 		return err
 	}
@@ -854,7 +896,12 @@ func (a *AwfulClient) ParseUnreadPosts(ctx context.Context, thread ThreadMetadat
 	if err != nil {
 		return posts, err
 	}
-	posts, err = a.parsePosts(ctx, res.Body)
+	body, err := convertToUtf8(res.Body)
+	if err != nil {
+		res.Body.Close()
+		return posts, err
+	}
+	posts, err = a.parsePosts(ctx, body)
 	res.Body.Close()
 	if err != nil {
 		return posts, err
@@ -884,7 +931,11 @@ func (a *AwfulClient) ParseLastThreadPosts(ctx context.Context, thread ThreadMet
 		return posts, err
 	}
 	defer res.Body.Close()
-	return a.parsePosts(ctx, res.Body)
+	body, err := convertToUtf8(res.Body)
+	if err != nil {
+		return posts, err
+	}
+	return a.parsePosts(ctx, body)
 }
 
 // ParsePagePosts returns all posts on the specific page of the thread.
@@ -899,7 +950,11 @@ func (a *AwfulClient) ParsePagePosts(ctx context.Context, thread ThreadMetadata,
 		return posts, err
 	}
 	defer res.Body.Close()
-	return a.parsePosts(ctx, res.Body)
+	body, err := convertToUtf8(res.Body)
+	if err != nil {
+		return posts, err
+	}
+	return a.parsePosts(ctx, body)
 }
 
 func (a *AwfulClient) parsePosts(ctx context.Context, body io.Reader) (Posts, error) {
@@ -1171,8 +1226,11 @@ func (a *AwfulClient) parsePrivateMessageID(ctx context.Context, id int64) (stri
 		return "", err
 	}
 	defer res.Body.Close()
-
-	doc, err := html.Parse(res.Body)
+	body, err := convertToUtf8(res.Body)
+	if err != nil {
+		return "", err
+	}
+	doc, err := html.Parse(body)
 	if err != nil {
 		return "", err
 	}
@@ -1435,8 +1493,11 @@ func (a *AwfulClient) parseThreadsFromResponse(res *http.Response) (parsedThread
 	if res.StatusCode != http.StatusOK {
 		return threads, fmt.Errorf("bad http status %v", res.StatusCode)
 	}
-
-	doc, err := html.Parse(res.Body)
+	body, err := convertToUtf8(res.Body)
+	if err != nil {
+		return threads, err
+	}
+	doc, err := html.Parse(body)
 	if err != nil {
 		return threads, fmt.Errorf("bad html: %w", err)
 	}
