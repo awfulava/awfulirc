@@ -369,7 +369,6 @@ func (s *Server) updateThreads(threads []ThreadMetadata) {
 	s.lock.Unlock()
 
 	for _, th := range threads {
-		s.lock.Lock()
 		got, ok := s.threads[th.ID]
 		if ok {
 			// Broadcast the title change as a channel topic update.
@@ -400,8 +399,6 @@ func (s *Server) updateThreads(threads []ThreadMetadata) {
 			s.threads[th.ID] = repr
 			s.shortNames[repr.shortName] = repr
 		}
-
-		s.lock.Unlock()
 	}
 }
 
