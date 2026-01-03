@@ -403,12 +403,15 @@ func (s *serverConnection) onPrivmsg(msg *ClientMessage) {
 				if _, ok := got.authors[replyTo]; ok {
 					// Hunt for the most recent post by that author.
 					// TODO: this should be indexed but who has time for that.
+					toFind := IRCToAuthor(replyTo)
 					for _, post := range slices.Backward(got.posts) {
-						var b strings.Builder
-						b.WriteString(fmt.Sprintf("[quote=%q post=\"%d\"]\n[/quote]\n\n", post.Author, post.ID))
-						b.WriteString(body)
-						message = b.String()
-						break
+						if post.Author == toFind {
+							var b strings.Builder
+							b.WriteString(fmt.Sprintf("[quote=%q post=\"%d\"]\n[/quote]\n\n", post.Author, post.ID))
+							b.WriteString(body)
+							message = b.String()
+							break
+						}
 					}
 				}
 				got.lock.Unlock()
